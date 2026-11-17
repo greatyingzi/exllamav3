@@ -25,6 +25,9 @@ from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_
 from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
 import json
+import io
+import socket
+import struct
 import threading
 from pathlib import Path
 from collections import deque
@@ -88,6 +91,7 @@ parser.add_argument("-ngb", "--ngram_bits", type = int, default = None, help = "
 parser.add_argument("-eb", "--embed_bits", type = int, default = None, help = "Bits per weight, token embedding table: 1-8, or 16 to store unquantized, default: 16")
 parser.add_argument("-ngf", "--ngram_file", type = str, default = None, help = "Pre-quantized n-gram table file (from util/convert_ngram.py) to use instead of quantizing the table")
 parser.add_argument("-r", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
+parser.add_argument("--dist_peer", type = str, default = None, help = "host:port of a distributed quantization peer (experimental)")
 parser.add_argument("-cd", "--cal_data", type = str, default = None, help = "Calibration data file (safetensors with packed token rows, e.g. from sc_trace.py) used instead of the bundled corpus mix")
 parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 250")
 parser.add_argument("-cc", "--cal_cols", type = int, help = "Calibration data size, columns, default: 2048")
@@ -363,6 +367,7 @@ def prepare(args) -> (dict, dict, bool, str):
     if in_args["hessians_one_sided"] and not in_args["hessians"]:
         return None, None, False, "--hessians_one_sided needs --hessians"
     in_args["max_module"] = args.max_module
+    in_args["dist_peer"] = args.dist_peer
 
     if args.resume:
         job_state = load_dict("ckpt/job.json", in_args)
@@ -1301,6 +1306,127 @@ def host_rss_str():
         return ""
 
 
+class PhaseTimer:
+    def __init__(self):
+        self.t = {}
+        self.mark = time.time()
+
+    def lap(self, name):
+        now = time.time()
+        self.t[name] = self.t.get(name, 0.0) + (now - self.mark)
+        self.mark = now
+
+    def line(self):
+        parts = " ".join(f"{k}={v:.1f}s" for k, v in self.t.items())
+        return f"   [phases] {parts} measured={sum(self.t.values()):.1f}s"
+
+
+class DistClient:
+    def __init__(self, addr):
+        host, port = addr.rsplit(":", 1)
+        self.sock = socket.create_connection((host, int(port)), timeout = 7200)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.f = self.sock.makefile("rwb", buffering = 1 << 20)
+        self.out_bytes = 0
+        self.in_bytes = 0
+
+    def call(self, blob = None, **req):
+        self.f.write((json.dumps(req) + "\n").encode("utf-8"))
+        self.f.flush()
+        if blob is not None:
+            self.f.write(struct.pack("<Q", len(blob)))
+            self.f.write(blob)
+            self.f.flush()
+            self.out_bytes += len(blob)
+        line = self.f.readline()
+        if not line:
+            raise RuntimeError("dist peer disconnected")
+        r = json.loads(line.decode("utf-8"))
+        if not r.get("ok"):
+            raise RuntimeError("dist peer op failed: " + str(r.get("err")) + "\n" + str(r.get("tb", "")))
+        if r.get("has_payload"):
+            n = struct.unpack("<Q", self.f.read(8))[0]
+            buf = bytearray()
+            while len(buf) < n:
+                c = self.f.read(n - len(buf))
+                if not c:
+                    raise EOFError("dist payload truncated")
+                buf.extend(c)
+            self.in_bytes += n
+            r["payload"] = bytes(buf)
+        return r
+
+
+def dist_split_groups(linears, strategy, capture_H):
+    """Partition the module's quantization groups in two, balanced by weight count, keeping order."""
+    groups = group_quant_linears(linears, strategy, capture_H)
+    sizes = [sum(l.weights_numel() for l in g) for g in groups]
+    order = sorted(range(len(groups)), key = lambda i: -sizes[i])
+    diff = 0
+    keep_a, keep_b = [], []
+    for i in order:
+        if diff <= 0:
+            keep_a.append(i)
+            diff += sizes[i]
+        else:
+            keep_b.append(i)
+            diff -= sizes[i]
+    mine = [l for i in sorted(keep_a) for l in groups[i]]
+    theirs = [l for i in sorted(keep_b) for l in groups[i]]
+    return mine, theirs
+
+
+def dist_begin(client, idx, linears, strategy, capture_H):
+    """Hand roughly half the groups to the peer and start it now; the local half runs
+    while the peer works, so the two are concurrent rather than sequential."""
+    mine, theirs = dist_split_groups(linears, strategy, capture_H)
+    if not theirs or not mine:
+        return None
+    H = {}
+    for l in theirs:
+        if l.qmap in capture_H and l.qmap not in H:
+            H[l.qmap] = capture_H[l.qmap]
+    buf = io.BytesIO()
+    torch.save(H, buf)
+    st = {
+        "t0": time.time(),
+        "client": client,
+        "idx": idx,
+        "mine": mine,
+        "peer_keys": set(l.key for l in theirs),
+        "keys": [l.key for l in theirs],
+        "strategy": {l.key: int(strategy[l.key]) for l in theirs},
+        "hblob": buf.getvalue(),
+        "out": {},
+    }
+    del buf
+
+    def job():
+        try:
+            st["client"].call(op = "load", idx = st["idx"])
+            st["out"]["r"] = st["client"].call(
+                blob = st["hblob"], op = "quant", idx = st["idx"],
+                keys = st["keys"], strategy = st["strategy"])
+        except BaseException as e:
+            st["out"]["err"] = e
+
+    st["thread"] = threading.Thread(target = job, daemon = True)
+    st["thread"].start()
+    return st
+
+
+def dist_finish(st):
+    st["thread"].join()
+    if "err" in st["out"]:
+        raise st["out"]["err"]
+    r = st["out"]["r"]
+    tens = torch.load(io.BytesIO(r["payload"]), map_location = "cpu", weights_only = False)
+    print(f" -- dist peer: {len(st['peer_keys'])} tensors on peer, {len(st['mine'])} local, "
+          f"peer alone {r.get('sec')}s, wall {time.time() - st['t0']:.1f}s, "
+          f"xfer {len(r['payload']) / 2**30:.2f} GiB", flush = True)
+    return tens, st["peer_keys"], st["mine"]
+
+
 def feedback_module(state, module, config, final_bpw, error, cos_error, sqnr_, module_time):
     if state:
         print(
@@ -1406,6 +1532,9 @@ def main(args, job_state):
                 print(f" -- Auto device split: {line}")
 
     last_checkpoint_time = time.time()
+    dist_client = DistClient(args["dist_peer"]) if args.get("dist_peer") else None
+    if dist_client is not None:
+        print(f" -- Distributed quantization peer: {args['dist_peer']}", flush = True)
 
     # Get model
     config, model, mtp_model, vision_model, tokenizer, use_reference_state = get_base_model(args)
@@ -1516,6 +1645,7 @@ def main(args, job_state):
         free_mem()
 
         start_module_time = time.time()
+        pt = PhaseTimer()
         if idx == model.first_block_idx:
             timed_blocks = 0
 
@@ -1561,6 +1691,7 @@ def main(args, job_state):
                 if m.used_alt_key and not slicing:
                     print(f"     - Cloned {m.key} from {m.alt_key}")
             module.config.stc.close()
+            pt.lap("load")
 
             aff_store = None
 
@@ -1651,6 +1782,7 @@ def main(args, job_state):
                     if aff_stores:
                         aff_store = merge_affinity_stores(aff_stores)
                         aff_stores = None
+                    pt.lap("capture")
                     print(f" -- Captured: {module.key}" + slice_str, flush = True)
 
                     # More feedback
@@ -1700,21 +1832,39 @@ def main(args, job_state):
                     quantize_linears_single(
                         args, linears_, config, strategy, idx, devices, eff_ratios("quant_tiles"), capture_H_, state, out_sens)
 
+            # Distributed: hand roughly half the groups to a peer, then quantize the rest here
+            peer_tensors = None
+            peer_keys = set()
+            dist_st = None
+            if dist_client is not None and aff_store is None and len(linears) > 1:
+                dist_st = dist_begin(dist_client, idx, linears, strategy, capture_H)
+                if dist_st is not None:
+                    peer_keys = dist_st["peer_keys"]
+                    linears = dist_st["mine"]
+
             # Gate/up projections of experts with affinity-weighted Hessians: per expert, a few at a time
             if aff_store is not None and aff_store["layers"]:
                 linears = quantize_affinity_gate_up(module, linears, capture_H, aff_store, quantize_list, device)
                 aff_store = None
             if linears:
                 quantize_list(linears, capture_H)
+                pt.lap("quantize")
+            if dist_st is not None:
+                peer_tensors, peer_keys, linears = dist_finish(dist_st)
 
             # Collect converted module tensors
             for m in module:
+                if peer_keys and isinstance(m, Linear) and m.key in peer_keys:
+                    continue
                 if m is module and isinstance(m, Embedding) and m.allow_table and args["embed_bits"] < 16:
                     tensors, rfn = quantize_embedding(m.key, m.embedding.weight.data, args["embed_bits"], device)
                     print(f" -- Quantized: {m.key}  bpw: {args['embed_bits']}  rfn: {rfn:.6f}")
                     q_tensors.update(tensors)
                 else:
                     q_tensors.update(m.get_tensors())
+
+            if peer_tensors:
+                q_tensors.update(peer_tensors)
 
             # Unload module
             if not module.caps.get("retain_during_quant"):
@@ -1811,6 +1961,9 @@ def main(args, job_state):
                 cos_error /= n
                 sqnr_ /= n
                 check_bad_rows(bad_rows, len(state))
+
+        pt.lap("advance")
+        print(pt.line(), flush = True)
 
         # Feedback after module. Trim first so the reported RSS reflects what the job actually
         # retains, not what the allocator happens to be holding

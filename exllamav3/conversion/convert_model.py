@@ -91,6 +91,8 @@ parser.add_argument("-ngb", "--ngram_bits", type = int, default = None, help = "
 parser.add_argument("-eb", "--embed_bits", type = int, default = None, help = "Bits per weight, token embedding table: 1-8, or 16 to store unquantized, default: 16")
 parser.add_argument("-ngf", "--ngram_file", type = str, default = None, help = "Pre-quantized n-gram table file (from util/convert_ngram.py) to use instead of quantizing the table")
 parser.add_argument("-r", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
+parser.add_argument("--quant_batch_cols", type = int, default = 32768, help = "Columns of a batched quantization group; larger groups give the quantizer wider matmuls, at the cost of workspace memory (default 32768)")
+parser.add_argument("--quant_stack", type = int, default = 16, help = "Tensors stacked per batched quantization group when they have individual Hessians (default 16)")
 parser.add_argument("--dist_peer", type = str, default = None, help = "host:port of a distributed quantization peer (experimental)")
 parser.add_argument("-cd", "--cal_data", type = str, default = None, help = "Calibration data file (safetensors with packed token rows, e.g. from sc_trace.py) used instead of the bundled corpus mix")
 parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 250")
@@ -334,6 +336,8 @@ def prepare(args) -> (dict, dict, bool, str):
         ("moe_affinity_eps", False, 0),  # 0 = off
         ("moe_affinity_rows", False, 262144),
         ("no_swap", True, False),
+        ("quant_batch_cols", True, 32768),
+        ("quant_stack", True, 16),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
 
@@ -676,7 +680,8 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
 
     # Batched group quantization has no two-sided LDLQ: per-tensor path when precomputed Hessians are in play
     allow_grouping = state is not None and not args["image_dump"] and not args["verbose"] and not args.get("hessians_two_sided")
-    groups = group_quant_linears(linears, strategy, capture_H if allow_grouping else None)
+    groups = group_quant_linears(linears, strategy, capture_H if allow_grouping else None,
+                                 args.get("quant_batch_cols", 32768), args.get("quant_stack", 16))
 
     for group in groups:
         if len(group) > 1:
@@ -747,7 +752,8 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
     global curr_progress, max_progress
 
     allow_grouping = state is not None and not args["verbose"] and not args.get("hessians_two_sided")
-    groups = group_quant_linears(linears, strategy, capture_H if allow_grouping else None)
+    groups = group_quant_linears(linears, strategy, capture_H if allow_grouping else None,
+                                 args.get("quant_batch_cols", 32768), args.get("quant_stack", 16))
 
     # Split workload by group
     all_dev_groups = [[] for _ in devices]
@@ -1357,9 +1363,10 @@ class DistClient:
         return r
 
 
-def dist_split_groups(linears, strategy, capture_H):
-    """Partition the module's quantization groups in two, balanced by weight count, keeping order."""
-    groups = group_quant_linears(linears, strategy, capture_H)
+def dist_split_groups(linears, strategy, capture_H, max_cat_cols = 32768, max_stack = 16):
+    """Partition the module's quantization groups in two, balanced by weight count, keeping order.
+    Must group exactly as quantize_linears_* will, or the split would cut through a group."""
+    groups = group_quant_linears(linears, strategy, capture_H, max_cat_cols, max_stack)
     sizes = [sum(l.weights_numel() for l in g) for g in groups]
     order = sorted(range(len(groups)), key = lambda i: -sizes[i])
     diff = 0
@@ -1376,10 +1383,10 @@ def dist_split_groups(linears, strategy, capture_H):
     return mine, theirs
 
 
-def dist_begin(client, idx, linears, strategy, capture_H):
+def dist_begin(client, idx, linears, strategy, capture_H, max_cat_cols = 32768, max_stack = 16):
     """Hand roughly half the groups to the peer and start it now; the local half runs
     while the peer works, so the two are concurrent rather than sequential."""
-    mine, theirs = dist_split_groups(linears, strategy, capture_H)
+    mine, theirs = dist_split_groups(linears, strategy, capture_H, max_cat_cols, max_stack)
     if not theirs or not mine:
         return None
     H = {}
@@ -1837,7 +1844,8 @@ def main(args, job_state):
             peer_keys = set()
             dist_st = None
             if dist_client is not None and aff_store is None and len(linears) > 1:
-                dist_st = dist_begin(dist_client, idx, linears, strategy, capture_H)
+                dist_st = dist_begin(dist_client, idx, linears, strategy, capture_H,
+                                     args.get("quant_batch_cols", 32768), args.get("quant_stack", 16))
                 if dist_st is not None:
                     peer_keys = dist_st["peer_keys"]
                     linears = dist_st["mine"]

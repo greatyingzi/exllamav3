@@ -91,6 +91,7 @@ parser.add_argument("-ngb", "--ngram_bits", type = int, default = None, help = "
 parser.add_argument("-eb", "--embed_bits", type = int, default = None, help = "Bits per weight, token embedding table: 1-8, or 16 to store unquantized, default: 16")
 parser.add_argument("-ngf", "--ngram_file", type = str, default = None, help = "Pre-quantized n-gram table file (from util/convert_ngram.py) to use instead of quantizing the table")
 parser.add_argument("-r", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
+parser.add_argument("--dist_rows", action = "store_true", help = "Split the calibration rows of each module with the peer as well (experimental)")
 parser.add_argument("--dist_peer", type = str, default = None, help = "host:port of a distributed quantization peer (experimental)")
 parser.add_argument("-cd", "--cal_data", type = str, default = None, help = "Calibration data file (safetensors with packed token rows, e.g. from sc_trace.py) used instead of the bundled corpus mix")
 parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 250")
@@ -368,6 +369,7 @@ def prepare(args) -> (dict, dict, bool, str):
         return None, None, False, "--hessians_one_sided needs --hessians"
     in_args["max_module"] = args.max_module
     in_args["dist_peer"] = args.dist_peer
+    in_args["dist_rows"] = args.dist_rows
 
     if args.resume:
         job_state = load_dict("ckpt/job.json", in_args)
@@ -1034,14 +1036,16 @@ def capture_module_serial(
     capture_qmaps = None,
     ref_pass = True,
     aff_store = None,
+    rows = None,
 ):
-    """Single-device Hessian capture over all calibration rows; see capture_module_parallel"""
+    """Single-device Hessian capture; rows defaults to every calibration row"""
     capture_H = {}
     capture_sens = {}
     ref_states = {}
-    with ProgressBar(title, len(state)) as progress:
-        for i in range(len(state)):
-            progress.update(i)
+    rows = range(len(state)) if rows is None else rows
+    with ProgressBar(title, len(rows)) as progress:
+        for _n, i in enumerate(rows):
+            progress.update(_n)
             if i in bad_rows:
                 continue
             params = {
@@ -1329,8 +1333,13 @@ class DistClient:
         self.f = self.sock.makefile("rwb", buffering = 1 << 20)
         self.out_bytes = 0
         self.in_bytes = 0
+        self.lock = threading.Lock()
 
     def call(self, blob = None, **req):
+        with self.lock:
+            return self.call_locked(blob, **req)
+
+    def call_locked(self, blob = None, **req):
         self.f.write((json.dumps(req) + "\n").encode("utf-8"))
         self.f.flush()
         if blob is not None:
@@ -1425,6 +1434,102 @@ def dist_finish(st):
           f"peer alone {r.get('sec')}s, wall {time.time() - st['t0']:.1f}s, "
           f"xfer {len(r['payload']) / 2**30:.2f} GiB", flush = True)
     return tens, st["peer_keys"], st["mine"]
+
+
+def dist_row_shard(num_rows, local_ratio = 0.5):
+    """Rows [0, k) stay on this machine, [k, num_rows) go to the peer."""
+    k = int(round(num_rows * local_ratio))
+    return max(1, min(num_rows - 1, k))
+
+
+def dist_rows_begin(client, op, idx, rows, state, quant_preserves, original_input_ids,
+                    extra = None, ref_rows = 0, all_experts = True):
+    """Ship a row shard to the peer and start it now; the local shard runs while it works.
+    Preserves mirror get_preserve/put_preserve: only the previous module's entry travels."""
+    prev = [dict(quant_preserves[i].get(idx - 1, {})) for i in rows]
+    pkt = {
+        "state": [state[i] for i in rows],
+        "preserves": prev,
+        "input_ids": [original_input_ids[i] for i in rows],
+    }
+    if extra:
+        pkt.update(extra)
+    buf = io.BytesIO()
+    torch.save(pkt, buf)
+    st = {
+        "t0": time.time(),
+        "client": client,
+        "idx": idx,
+        "op": op,
+        "rows": rows,
+        "prev": [dict(x) for x in prev],
+        "blob": buf.getvalue(),
+        "out": {},
+    }
+    del buf, pkt, prev
+
+    def job():
+        try:
+            kw = {"op": op, "idx": idx, "row0": rows[0], "row1": rows[-1] + 1}
+            if op == "capture":
+                kw["ref_rows"] = ref_rows
+                kw["all_experts"] = bool(all_experts)
+            st["out"]["r"] = st["client"].call(blob = st["blob"], **kw)
+        except BaseException as e:
+            st["out"]["err"] = e
+
+    st["thread"] = threading.Thread(target = job, daemon = True)
+    st["thread"].start()
+    return st
+
+
+def dist_rows_finish(st):
+    st["thread"].join()
+    if "err" in st["out"]:
+        raise st["out"]["err"]
+    r = st["out"]["r"]
+    pkt = torch.load(io.BytesIO(r["payload"]), map_location = "cpu", weights_only = False)
+    print(f" -- dist rows: {len(st['rows'])} remote rows, {st['op']} took {r.get('sec')}s "
+          f"(wall {time.time() - st['t0']:.1f}s)", flush = True)
+    return pkt
+
+
+def dist_capture_merge(capture_H, capture_sens, ref_states, device, pkt):
+    """Same merge capture_module_parallel does for a local shard."""
+    for qmap, hd in pkt["H"].items():
+        if qmap not in capture_H:
+            hd["H"] = hd["H"].to(device)
+            if "H_aff" in hd:
+                hd["H_aff"] = hd["H_aff"].to(device)
+                hd["aff_sum"] = hd["aff_sum"].to(device)
+            hd["inf_nan"] = hd["inf_nan"].to(device)
+            hd["device"] = device
+            capture_H[qmap] = hd
+        else:
+            m = capture_H[qmap]
+            m["H"] += hd["H"].to(device)
+            if "H_aff" in hd:
+                if "H_aff" in m:
+                    m["H_aff"] += hd["H_aff"].to(device)
+                    m["aff_sum"] += hd["aff_sum"].to(device)
+                else:
+                    m["H_aff"] = hd["H_aff"].to(device)
+                    m["aff_sum"] = hd["aff_sum"].to(device)
+            m["count"] += hd["count"]
+            m["num_total"] += hd["num_total"]
+            m["inf_nan"] += hd["inf_nan"].to(device)
+    merge_out_sensitivity(capture_sens, pkt["sens"])
+    for i, t in pkt["ref"].items():
+        ref_states[i] = t
+
+
+def dist_rows_adopt(st, pkt, quant_preserves, state = None):
+    """Take back what the peer produced for its rows, mirroring put_preserve."""
+    if state is not None:
+        for n, i in enumerate(st["rows"]):
+            state[i] = pkt["state"][n]
+    for n, i in enumerate(st["rows"]):
+        quant_preserves[i] = {st["idx"] - 1: st["prev"][n], st["idx"]: pkt["preserves"][n]}
 
 
 def feedback_module(state, module, config, final_bpw, error, cos_error, sqnr_, module_time):
@@ -1535,6 +1640,9 @@ def main(args, job_state):
     dist_client = DistClient(args["dist_peer"]) if args.get("dist_peer") else None
     if dist_client is not None:
         print(f" -- Distributed quantization peer: {args['dist_peer']}", flush = True)
+    dist_rows_peer = dist_client if args.get("dist_rows") else None
+    if dist_rows_peer is not None:
+        print(" -- Distributed rows: calibration rows will be split with the peer", flush = True)
 
     # Get model
     config, model, mtp_model, vision_model, tokenizer, use_reference_state = get_base_model(args)
@@ -1745,6 +1853,16 @@ def main(args, job_state):
                                 aff_stores,
                             )
                         else:
+                            dist_cap = None
+                            cap_rows = None
+                            if dist_rows_peer is not None and aff_stores is None and len(passes) == 1 and not slicing:
+                                _k = dist_row_shard(len(state))
+                                cap_rows = range(_k)
+                                dist_cap = dist_rows_begin(
+                                    dist_rows_peer, "capture", idx, list(range(_k, len(state))),
+                                    state, quant_preserves, original_input_ids,
+                                    ref_rows = num_ref_states,
+                                    all_experts = model.calibration_all_experts)
                             pass_H, pass_sens, pass_ref = capture_module_serial(
                                 model,
                                 module,
@@ -1759,7 +1877,13 @@ def main(args, job_state):
                                 pass_qmaps,
                                 pass_idx == 0,
                                 aff_stores[0] if aff_stores else None,
+                                cap_rows,
                             )
+                            if dist_cap is not None:
+                                _pkt = dist_rows_finish(dist_cap)
+                                dist_capture_merge(pass_H, pass_sens, pass_ref, module.device, _pkt)
+                                dist_rows_adopt(dist_cap, _pkt, quant_preserves)
+                                del _pkt
                         if aff_stores:
                             n_aff = combine_affinity_down(pass_H, moe_aff_eps)
                             if n_aff:
@@ -1895,6 +2019,13 @@ def main(args, job_state):
         if state is not None and parallel_calib and not module.caps.get("prefer_cpu"):
             advance_replicas, calib_devices = load_parallel_calib_modules(
                 replica_models, idx, devices, None, source = q_tensors, need_bytes = _weight_bytes(module, q_tensors))
+        dist_adv = None
+        if dist_rows_peer is not None and state is not None and not slicing:
+            _k = dist_row_shard(len(state))
+            dist_adv = dist_rows_begin(
+                dist_rows_peer, "advance", idx, list(range(_k, len(state))),
+                state, quant_preserves, original_input_ids,
+                extra = {"qtensors": q_tensors})
         config.stc.set_new_tensors(None)
         del q_tensors
 
@@ -1929,9 +2060,12 @@ def main(args, job_state):
                 check_bad_rows(bad_rows, len(state))
             else:
                 num_measured = 0
-                with ProgressBar(f" -- Forward pass: {module.key}", len(state)) as progress:
-                    for i in range(len(state)):
-                        progress.update(i)
+                adv_rows = range(len(state))
+                if dist_adv is not None:
+                    adv_rows = range(dist_row_shard(len(state)))
+                with ProgressBar(f" -- Forward pass: {module.key}", len(adv_rows)) as progress:
+                    for _n, i in enumerate(adv_rows):
+                        progress.update(_n)
                         if i in bad_rows:
                             continue
                         params = {
@@ -1956,6 +2090,10 @@ def main(args, job_state):
                             sqnr_ += sq
                             num_measured += 1
                             ref_states[i] = None
+                if dist_adv is not None:
+                    _pkt = dist_rows_finish(dist_adv)
+                    dist_rows_adopt(dist_adv, _pkt, quant_preserves, state)
+                    del _pkt
                 n = max(num_measured, 1)
                 error /= n
                 cos_error /= n

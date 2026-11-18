@@ -92,6 +92,93 @@ def serve_conn(conn, f, cm, args, model, config, device, cached):
                 resp["n_tensors"] = len(tens)
                 del tens, buf
                 torch.cuda.empty_cache()
+            elif op == "capture":
+                blob = recv_blob(f)
+                if blob is None:
+                    return
+                pkt = torch.load(io.BytesIO(blob), map_location = device, weights_only = False)
+                del blob
+                idx = int(req["idx"])
+                row0, row1 = int(req["row0"]), int(req["row1"])
+                ref_rows = int(req.get("ref_rows", 0))
+                all_experts = bool(req.get("all_experts", True))
+                if cached["idx"] != idx:
+                    if cached["idx"] is not None:
+                        model.modules[cached["idx"]].unload()
+                        cm.free_mem()
+                        cached["idx"] = None
+                    model.modules[idx].load(device, keep_source_weights = True)
+                    model.modules[idx].config.stc.close()
+                    cached["idx"] = idx
+                mod = model.modules[idx]
+                st_rows, preserves, ids = pkt["state"], pkt["preserves"], pkt["input_ids"]
+                H, sens, ref = {}, {}, {}
+                for n, i in enumerate(range(row0, row1)):
+                    params = {
+                        "attn_mode": "flash_attn_nc",
+                        "capture": H,
+                        "capture_sens": sens,
+                        "activate_all_experts": all_experts,
+                        "capture_only": all_experts,
+                        "input_ids": ids[n],
+                        "quant_preserve": preserves[n],
+                    }
+                    rs = mod.prepare_for_device(st_rows[n], params)
+                    rs = mod.forward(rs, params)
+                    preserves[n] = params["quant_preserve"]
+                    if i < ref_rows and all_experts:
+                        p2 = {
+                            "attn_mode": "flash_attn_nc",
+                            "input_ids": ids[n],
+                            "quant_preserve": preserves[n],
+                        }
+                        rs2 = mod.prepare_for_device(st_rows[n], p2)
+                        rs2 = mod.forward(rs2, p2)
+                        preserves[n] = p2["quant_preserve"]
+                        if torch.isfinite(rs2).all().item():
+                            ref[i] = rs2.cpu()
+                    rs = None
+                buf = io.BytesIO()
+                torch.save({"H": H, "sens": sens, "preserves": preserves, "ref": ref}, buf)
+                payload = buf.getvalue()
+                resp["rows"] = row1 - row0
+                del buf, H, sens, ref
+            elif op == "advance":
+                blob = recv_blob(f)
+                if blob is None:
+                    return
+                pkt = torch.load(io.BytesIO(blob), map_location = device, weights_only = False)
+                del blob
+                idx = int(req["idx"])
+                row0, row1 = int(req["row0"]), int(req["row1"])
+                if cached["idx"] != idx:
+                    if cached["idx"] is not None:
+                        model.modules[cached["idx"]].unload()
+                        cm.free_mem()
+                        cached["idx"] = None
+                    cached["idx"] = idx
+                mod = model.modules[idx]
+                # load the merged quantized module so the forward matches the caller's
+                mod.load(device, source = pkt["qtensors"], keep_source_weights = True)
+                mod.config.stc.close()
+                del pkt["qtensors"]
+                st_rows, preserves, ids = pkt["state"], pkt["preserves"], pkt["input_ids"]
+                for n, i in enumerate(range(row0, row1)):
+                    params = {
+                        "attn_mode": "flash_attn_nc",
+                        "input_ids": ids[n],
+                        "quant_preserve": preserves[n],
+                    }
+                    x = mod.prepare_for_device(st_rows[n], params)
+                    rs = mod.forward(x, params)
+                    preserves[n] = params["quant_preserve"]
+                    st_rows[n] = rs
+                buf = io.BytesIO()
+                torch.save({"state": st_rows, "preserves": preserves}, buf)
+                payload = buf.getvalue()
+                resp["rows"] = row1 - row0
+                del buf, st_rows, preserves
+                torch.cuda.empty_cache()
             elif op == "unload":
                 if cached["idx"] is not None:
                     model.modules[cached["idx"]].unload()
